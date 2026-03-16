@@ -889,7 +889,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "\n\n## Backpressure Checks (ACTIVE)" +
         `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
         "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
-        "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, revert changes)." +
+        "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
         "\nYou cannot use status 'keep' when checks have failed." +
         "\nThe checks execution time does NOT affect the primary metric.";
     }
@@ -1250,7 +1250,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Always call log_experiment after run_experiment to record the result.",
       "After run_experiment, always call log_experiment to record the result.",
-      "log_experiment automatically runs git add -A && git commit with the description and a Result trailer. Do NOT commit manually before calling log_experiment.",
+      "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
     ],
@@ -1414,19 +1414,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } catch (e) {
           text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
         }
-      } else {
-        text += `\n📝 Git: skipped commit (${params.status}) — revert with git checkout -- .`;
       }
 
-      // Persist to autoresearch.jsonl AFTER git commit (so commit hash is correct)
+      // Persist to autoresearch.jsonl (always, regardless of status)
       try {
         const jsonlPath = path.join(workDir, "autoresearch.jsonl");
         fs.appendFileSync(jsonlPath, JSON.stringify({
           run: state.results.length,
           ...experiment,
         }) + "\n");
-      } catch {
-        // Don't fail if write fails
+      } catch (e) {
+        text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
+      if (params.status !== "keep") {
+        try {
+          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
+          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
+          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+        } catch (e) {
+          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
       }
 
       // Clear running experiment and checks state (log_experiment consumes the run)
