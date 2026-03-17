@@ -18,12 +18,22 @@ import type {
   ExtensionContext,
   Theme,
 } from "@mariozechner/pi-coding-agent";
-import { truncateTail } from "@mariozechner/pi-coding-agent";
+import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { Text, truncateToWidth, matchesKey } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+
+// ---------------------------------------------------------------------------
+// Experiment output limits (sent to LLM — keep small to save context)
+// ---------------------------------------------------------------------------
+const EXPERIMENT_MAX_LINES = 10;
+const EXPERIMENT_MAX_BYTES = 4 * 1024; // 4KB
 
 // ---------------------------------------------------------------------------
 // Types
@@ -193,6 +203,40 @@ function formatNum(value: number | null, unit: string): string {
   if (value === Math.round(value)) return fmtNum(value) + u;
   // Fractional: 2 decimal places
   return fmtNum(value, 2) + u;
+}
+
+/** Generate a unique temp file path for experiment output */
+function getTempFilePath(): string {
+  const id = randomBytes(8).toString("hex");
+  return path.join(tmpdir(), `pi-experiment-${id}.log`);
+}
+
+/** Format elapsed milliseconds as "Xm XXs" or "XXs" */
+function formatElapsed(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+/** Kill a process tree (best effort, tries process group first) */
+function killTree(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Process may have already exited
+    }
+  }
+}
+
+/** Check if a command string is running autoresearch.sh (or ./autoresearch.sh) */
+function isAutoresearchShCommand(command: string): boolean {
+  const trimmed = command.trim();
+  return /(?:^|\s)(?:\.\/)?autoresearch\.sh(?:\s|$)/.test(trimmed);
 }
 
 function isBetter(
@@ -427,7 +471,7 @@ function renderDashboardLines(
   const baselineSuffix = baselineRunNumber === null ? "" : ` #${baselineRunNumber}`;
   lines.push(
     truncateToWidth(
-      `  ${th.fg("muted", "Baseline:")} ${th.fg("dim", `★ ${st.metricName}: ${formatNum(baseline, st.metricUnit)}${baselineSuffix}`)}`,
+      `  ${th.fg("muted", "Baseline:")} ${th.fg("muted", `★ ${st.metricName}: ${formatNum(baseline, st.metricUnit)}${baselineSuffix}`)}`,
       width
     )
   );
@@ -446,14 +490,18 @@ function renderDashboardLines(
 
     lines.push(truncateToWidth(progressLine, width));
 
-    // Progress secondary metrics on next line with deltas
+    // Progress secondary metrics — wrap into lines that fit width, indented
     if (st.secondaryMetrics.length > 0) {
+      const indent = "            "; // 12 chars to align under progress value
+      const maxLineW = width - 2 - indent.length; // 2 for leading "  "
+
+      // Build individually-colored parts
       const secParts: string[] = [];
       for (const sm of st.secondaryMetrics) {
         const val = bestSecondary[sm.name];
         const bv = baselineSec[sm.name];
         if (val !== undefined) {
-          let part = `${sm.name}: ${formatNum(val, sm.unit)}`;
+          let part = th.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`);
           if (bv !== undefined && bv !== 0 && val !== bv) {
             const p = ((val - bv) / bv) * 100;
             const s = p > 0 ? "+" : "";
@@ -463,13 +511,26 @@ function renderDashboardLines(
           secParts.push(part);
         }
       }
+
+      // Flow-wrap parts into lines
       if (secParts.length > 0) {
-        lines.push(
-          truncateToWidth(
-            `  ${th.fg("dim", "          ")}${th.fg("muted", secParts.join("  "))}`,
-            width
-          )
-        );
+        let curLine = "";
+        let curVisW = 0;
+        for (const part of secParts) {
+          const partVisW = visibleWidth(part);
+          const sep = curLine ? "  " : "";
+          if (curLine && curVisW + sep.length + partVisW > maxLineW) {
+            lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
+            curLine = part;
+            curVisW = partVisW;
+          } else {
+            curLine += sep + part;
+            curVisW += sep.length + partVisW;
+          }
+        }
+        if (curLine) {
+          lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
+        }
       }
     }
   }
@@ -486,14 +547,21 @@ function renderDashboardLines(
     visibleRows.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
   );
 
-  // Column definitions
+  // Column definitions — guarantee 25% of width for description
   const col = { idx: 3, commit: 8, primary: 11, status: 15 };
   const secColWidth = 11;
-  const totalSecWidth = secMetrics.length * secColWidth;
-  const descW = Math.max(
-    10,
-    width - col.idx - col.commit - col.primary - totalSecWidth - col.status - 6
-  );
+  const minDescW = Math.max(10, Math.floor(width * 0.25));
+  const fixedW = col.idx + col.commit + col.primary + col.status + 6;
+  const availableForSec = width - fixedW - minDescW;
+
+  // Drop secondary columns from the right until they fit
+  let visibleSecMetrics = secMetrics;
+  while (visibleSecMetrics.length > 0 && visibleSecMetrics.length * secColWidth > availableForSec) {
+    visibleSecMetrics = visibleSecMetrics.slice(0, -1);
+  }
+
+  const totalSecWidth = visibleSecMetrics.length * secColWidth;
+  const descW = Math.max(minDescW, width - fixedW - totalSecWidth);
 
   // Table header — primary metric name bolded with ★
   let headerLine =
@@ -501,7 +569,7 @@ function renderDashboardLines(
     `${th.fg("muted", "commit".padEnd(col.commit))}` +
     `${th.fg("warning", th.bold(("★ " + st.metricName).slice(0, col.primary - 1).padEnd(col.primary)))}`;
 
-  for (const sm of secMetrics) {
+  for (const sm of visibleSecMetrics) {
     headerLine += th.fg(
       "muted",
       sm.name.slice(0, secColWidth - 1).padEnd(secColWidth)
@@ -556,7 +624,7 @@ function renderDashboardLines(
     let primaryColor: Parameters<typeof th.fg>[0] = isOld ? "dim" : "text";
     if (!isOld) {
       if (isBaseline) {
-        primaryColor = "muted"; // baseline row
+        primaryColor = "text"; // baseline row — normal text
       } else if (
         baselinePrimary !== null &&
         r.status === "keep" &&
@@ -578,9 +646,9 @@ function renderDashboardLines(
       `${th.fg(isOld ? "dim" : "accent", commitStr)}` +
       `${th.fg(primaryColor, isOld ? primaryStr.padEnd(col.primary) : th.bold(primaryStr.padEnd(col.primary)))}`;
 
-    // Secondary metrics
+    // Secondary metrics (only visible columns)
     const rowMetrics = r.metrics ?? {};
-    for (const sm of secMetrics) {
+    for (const sm of visibleSecMetrics) {
       const val = rowMetrics[sm.name];
       if (val !== undefined) {
         const secStr = formatNum(val, sm.unit);
@@ -588,7 +656,7 @@ function renderDashboardLines(
         if (!isOld) {
           const bv = baselineSecondary[sm.name];
           if (isBaseline) {
-            secColor = "muted"; // baseline row
+            secColor = "text"; // baseline row — normal text
           } else if (bv !== undefined && bv !== 0) {
             secColor = val <= bv ? "success" : "error";
           }
@@ -879,14 +947,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const bv = baselineSec[sm.name];
             if (val !== undefined) {
               parts.push(theme.fg("dim", "  "));
-              let secText = `${sm.name}: ${formatNum(val, sm.unit)}`;
+              // Color value and delta separately to avoid color bleed
+              parts.push(theme.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`));
               if (bv !== undefined && bv !== 0 && val !== bv) {
                 const p = ((val - bv) / bv) * 100;
                 const s = p > 0 ? "+" : "";
                 const c = val <= bv ? "success" : "error";
-                secText += theme.fg(c, ` ${s}${p.toFixed(1)}%`);
+                parts.push(theme.fg(c, ` ${s}${p.toFixed(1)}%`));
               }
-              parts.push(theme.fg("muted", secText));
             }
           }
         }
@@ -1109,7 +1177,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "run_experiment",
     label: "Run Experiment",
     description:
-      "Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Use for any autoresearch experiment.",
+      `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
     promptSnippet:
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
@@ -1145,33 +1213,165 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
+      // Guard: if autoresearch.sh exists, only allow running it
+      const autoresearchShPath = path.join(workDir, "autoresearch.sh");
+      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+          } as RunDetails,
+        };
+      }
+
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
-      onUpdate?.({
-        content: [{ type: "text", text: `Running: ${params.command}` }],
-        details: { phase: "running" },
-      });
-
       const t0 = Date.now();
 
-      let result;
-      try {
-        result = await pi.exec("bash", ["-c", params.command], {
-          signal,
-          timeout,
+      // Spawn the process directly (like the bash tool) for streaming output
+      const { exitCode, killed: timedOut, output } = await new Promise<{
+        exitCode: number | null;
+        killed: boolean;
+        output: string;
+      }>((resolve, reject) => {
+        let processTimedOut = false;
+
+        const child = spawn("bash", ["-c", params.command], {
           cwd: workDir,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
         });
-      } finally {
+
+        // Rolling buffer for tail truncation (keep 2x what we need)
+        const chunks: Buffer[] = [];
+        let chunksBytes = 0;
+        const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
+
+        // Temp file for full output when it overflows
+        let tempFilePath: string | undefined;
+        let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
+        let totalBytes = 0;
+
+        // Timer interval — update every second with elapsed time + tail output
+        const timerInterval = setInterval(() => {
+          if (!onUpdate) return;
+          const elapsed = formatElapsed(Date.now() - t0);
+          const fullBuffer = Buffer.concat(chunks);
+          const fullText = fullBuffer.toString("utf-8");
+          const trunc = truncateTail(fullText, {
+            maxLines: DEFAULT_MAX_LINES,
+            maxBytes: DEFAULT_MAX_BYTES,
+          });
+          onUpdate({
+            content: [{ type: "text", text: trunc.content || "" }],
+            details: {
+              phase: "running",
+              elapsed,
+              truncation: trunc.truncated ? trunc : undefined,
+              fullOutputPath: tempFilePath,
+            },
+          });
+        }, 1000);
+
+        const handleData = (data: Buffer) => {
+          totalBytes += data.length;
+
+          // Start writing to temp file once we exceed the threshold
+          if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
+            tempFilePath = getTempFilePath();
+            tempFileStream = createWriteStream(tempFilePath);
+            for (const chunk of chunks) {
+              tempFileStream.write(chunk);
+            }
+          }
+
+          if (tempFileStream) {
+            tempFileStream.write(data);
+          }
+
+          // Keep rolling buffer of recent data
+          chunks.push(data);
+          chunksBytes += data.length;
+
+          while (chunksBytes > maxChunksBytes && chunks.length > 1) {
+            const removed = chunks.shift()!;
+            chunksBytes -= removed.length;
+          }
+        };
+
+        if (child.stdout) child.stdout.on("data", handleData);
+        if (child.stderr) child.stderr.on("data", handleData);
+
+        // Timeout
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        if (timeout > 0) {
+          timeoutHandle = setTimeout(() => {
+            processTimedOut = true;
+            if (child.pid) killTree(child.pid);
+          }, timeout);
+        }
+
+        // Abort signal
+        const onAbort = () => {
+          if (child.pid) killTree(child.pid);
+        };
+        if (signal) {
+          if (signal.aborted) {
+            onAbort();
+          } else {
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
+        }
+
+        child.on("error", (err) => {
+          clearInterval(timerInterval);
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (signal) signal.removeEventListener("abort", onAbort);
+          if (tempFileStream) tempFileStream.end();
+          reject(err);
+        });
+
+        child.on("close", (code) => {
+          clearInterval(timerInterval);
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (signal) signal.removeEventListener("abort", onAbort);
+          if (tempFileStream) tempFileStream.end();
+
+          if (signal?.aborted) {
+            reject(new Error("aborted"));
+            return;
+          }
+
+          const fullBuffer = Buffer.concat(chunks);
+          resolve({
+            exitCode: code,
+            killed: processTimedOut,
+            output: fullBuffer.toString("utf-8"),
+          });
+        });
+      }).finally(() => {
         runtime.runningExperiment = null;
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
-      }
+      });
 
       const durationSeconds = (Date.now() - t0) / 1000;
-      const output = (result.stdout + "\n" + result.stderr).trim();
-      const benchmarkPassed = result.code === 0 && !result.killed;
+      const benchmarkPassed = exitCode === 0 && !timedOut;
 
       // Run backpressure checks if benchmark passed and checks file exists
       let checksPass: boolean | null = null;
@@ -1203,17 +1403,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Store checks result for log_experiment gate
       runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
 
-      // Overall pass: benchmark must pass AND checks must pass (if they ran)
       const passed = benchmarkPassed && (checksPass === null || checksPass);
+
+      // Save full output to temp file when large
+      let fullOutputPath: string | undefined;
+      const totalBytes = Buffer.byteLength(output, "utf-8");
+      const totalLines = output.split("\n").length;
+      if (totalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES) {
+        fullOutputPath = getTempFilePath();
+        fs.writeFileSync(fullOutputPath, output);
+      }
+
+      // Wider truncation for TUI display (details.tailOutput)
+      const displayTruncation = truncateTail(output, {
+        maxLines: DEFAULT_MAX_LINES,
+        maxBytes: DEFAULT_MAX_BYTES,
+      });
+
+      // Tight truncation for LLM context (10 lines / 4KB)
+      const llmTruncation = truncateTail(output, {
+        maxLines: EXPERIMENT_MAX_LINES,
+        maxBytes: EXPERIMENT_MAX_BYTES,
+      });
 
       const details: RunDetails = {
         command: params.command,
-        exitCode: result.code,
+        exitCode,
         durationSeconds,
         passed,
         crashed: !passed,
-        timedOut: !!result.killed,
-        tailOutput: output.split("\n").slice(-80).join("\n"),
+        timedOut,
+        tailOutput: displayTruncation.content,
         checksPass,
         checksTimedOut,
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
@@ -1225,7 +1445,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
       } else if (!benchmarkPassed) {
-        text += `💥 FAILED (exit code ${result.code}) in ${durationSeconds.toFixed(1)}s\n`;
+        text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
       } else if (checksTimedOut) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
@@ -1245,20 +1465,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
       }
 
-      text += `\nLast 80 lines of output:\n${details.tailOutput}`;
+      text += `\n${llmTruncation.content}`;
+
+      if (llmTruncation.truncated) {
+        if (llmTruncation.truncatedBy === "lines") {
+          text += `\n\n[Showing last ${llmTruncation.outputLines} of ${llmTruncation.totalLines} lines.`;
+        } else {
+          text += `\n\n[Showing last ${llmTruncation.outputLines} lines (${formatSize(EXPERIMENT_MAX_BYTES)} limit).`;
+        }
+        if (fullOutputPath) {
+          text += ` Full output: ${fullOutputPath}`;
+        }
+        text += `]`;
+      }
 
       if (checksPass === false) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
 
-      const truncation = truncateTail(text, {
-        maxLines: 150,
-        maxBytes: 40000,
-      });
-
       return {
-        content: [{ type: "text", text: truncation.content }],
-        details,
+        content: [{ type: "text", text }],
+        details: { ...details, truncation: llmTruncation.truncated ? llmTruncation : undefined, fullOutputPath },
       };
     },
 
@@ -1272,57 +1499,79 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
+      const PREVIEW_LINES = 5;
+
       if (isPartial) {
-        return new Text(
-          theme.fg("warning", "⏳ Running experiment..."),
-          0,
-          0
-        );
+        // Streaming: show elapsed timer + tail of output
+        const d = result.details as { phase?: string; elapsed?: string; truncation?: any; fullOutputPath?: string } | undefined;
+        const elapsed = d?.elapsed ?? "";
+        const outputText = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+        let text = theme.fg("warning", `⏳ Running${elapsed ? ` ${elapsed}` : ""}…`);
+
+        // Always show tail of streaming output (like bash tool shows preview lines)
+        if (outputText) {
+          const lines = outputText.split("\n");
+          const maxLines = expanded ? 20 : PREVIEW_LINES;
+          const tail = lines.slice(-maxLines).join("\n");
+          if (tail.trim()) {
+            text += "\n" + theme.fg("dim", tail);
+          }
+        }
+
+        return new Text(text, 0, 0);
       }
 
-      const d = result.details as RunDetails | undefined;
+      const d = result.details as (RunDetails & { truncation?: any; fullOutputPath?: string }) | undefined;
       if (!d) {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
 
+      // Helper: append tail output preview or full output
+      const appendOutput = (text: string, output: string): string => {
+        if (!output) return text;
+        const lines = output.split("\n");
+        if (expanded) {
+          text += "\n" + theme.fg("dim", output.slice(-2000));
+        } else {
+          const tail = lines.slice(-PREVIEW_LINES).join("\n");
+          if (tail.trim()) {
+            const hidden = lines.length - PREVIEW_LINES;
+            if (hidden > 0) {
+              text += "\n" + theme.fg("muted", `… ${hidden} more lines`);
+            }
+            text += "\n" + theme.fg("dim", tail);
+          }
+        }
+        return text;
+      };
+
       if (d.timedOut) {
-        let text = theme.fg(
-          "error",
-          `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`
-        );
-        if (expanded) text += "\n" + theme.fg("dim", d.tailOutput.slice(-500));
+        let text = theme.fg("error", `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`);
+        text = appendOutput(text, d.tailOutput);
         return new Text(text, 0, 0);
       }
 
       if (d.checksTimedOut) {
-        // Benchmark passed but checks timed out
         let text =
           theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
           theme.fg("error", ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`);
-        if (expanded) {
-          text += "\n" + theme.fg("dim", d.checksOutput.slice(-500));
-        }
+        text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
       }
 
       if (d.checksPass === false) {
-        // Benchmark passed but checks failed
         let text =
           theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
           theme.fg("error", ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`);
-        if (expanded) {
-          text += "\n" + theme.fg("dim", d.checksOutput.slice(-500));
-        }
+        text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
       }
 
       if (d.crashed) {
-        let text = theme.fg(
-          "error",
-          `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`
-        );
-        if (expanded) text += "\n" + theme.fg("dim", d.tailOutput.slice(-500));
+        let text = theme.fg("error", `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`);
+        text = appendOutput(text, d.tailOutput);
         return new Text(text, 0, 0);
       }
 
@@ -1334,8 +1583,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += theme.fg("success", ` ✓ checks ${d.checksDuration.toFixed(1)}s`);
       }
 
-      if (expanded) {
-        text += "\n" + theme.fg("dim", d.tailOutput.slice(-1000));
+      if (d.truncation?.truncated && d.fullOutputPath) {
+        text += theme.fg("warning", " (truncated)");
+      }
+
+      text = appendOutput(text, d.tailOutput);
+
+      if (expanded && d.truncation?.truncated && d.fullOutputPath) {
+        if (d.truncation.truncatedBy === "lines") {
+          text += "\n" + theme.fg("warning", `[Truncated: showing ${d.truncation.outputLines} of ${d.truncation.totalLines} lines. Full output: ${d.fullOutputPath}]`);
+        } else {
+          text += "\n" + theme.fg("warning", `[Truncated: ${d.truncation.outputLines} lines shown (${formatSize(EXPERIMENT_MAX_BYTES)} limit). Full output: ${d.fullOutputPath}]`);
+        }
       }
 
       return new Text(text, 0, 0);
@@ -1685,13 +1944,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
             if (runtime.runningExperiment) tui.requestRender();
           }, 80);
-
-          function formatElapsed(ms: number): string {
-            const s = Math.floor(ms / 1000);
-            const m = Math.floor(s / 60);
-            const sec = s % 60;
-            return m > 0 ? `${m}m${String(sec).padStart(2, "0")}s` : `${sec}s`;
-          }
 
           return {
             render(width: number): string[] {
