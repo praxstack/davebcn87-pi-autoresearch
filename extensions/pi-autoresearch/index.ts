@@ -2349,11 +2349,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (runtime.runningExperiment) tui.requestRender();
           }, 80);
 
+          const computeViewportRows = () => {
+            const termH = process.stdout.rows || 40;
+            const overlayMaxH = Math.floor(termH * 0.9);
+            return Math.max(4, overlayMaxH - 4);
+          };
+
           return {
             render(width: number): string[] {
-              const termH = process.stdout.rows || 40;
-              // Content gets the full width — no box borders
-              const content = renderDashboardLines(state, width, theme, 0);
+              const border = (s: string) => theme.fg("accent", s);
+
+              // Inner content width: │ + space + content + space + │
+              const innerWidth = Math.max(10, width - 4);
+              const content = renderDashboardLines(state, innerWidth, theme, 0);
 
               // Add running experiment as next row in the list
               if (runtime.runningExperiment) {
@@ -2364,13 +2372,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                   truncateToWidth(
                     `  ${theme.fg("dim", String(nextIdx).padEnd(3))}` +
                     theme.fg("warning", `${frame} running… ${elapsed}`),
-                    width
+                    innerWidth
                   )
                 );
               }
 
               const totalRows = content.length;
-              const viewportRows = Math.max(4, termH - 4); // leave room for header/footer
+              const viewportRows = computeViewportRows();
 
               // Clamp scroll
               const maxScroll = Math.max(0, totalRows - viewportRows);
@@ -2379,44 +2387,62 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
               const out: string[] = [];
 
-              // Header line
+              // Top border with embedded title: ┌── 🔬 autoresearch: name ──────┐
               const titlePrefix = "🔬 autoresearch";
               const nameStr = state.name ? `: ${state.name}` : "";
-              const maxTitleLen = width - 6;
               let title = titlePrefix + nameStr;
-              if (title.length > maxTitleLen) {
-                title = title.slice(0, maxTitleLen - 1) + "…";
+              const titleVisW = visibleWidth(title);
+              // Budget: ┌── (3) + space (1) + title + space (1) + fill + ┐ (1) = width
+              const maxTitleVisW = width - 6;
+              if (titleVisW > maxTitleVisW) {
+                title = truncateToWidth(title, Math.max(5, maxTitleVisW));
               }
-              const fillLen = Math.max(0, width - 3 - 1 - title.length - 1);
+              const titleActualVisW = visibleWidth(title);
+              const topFillLen = Math.max(0, width - 6 - titleActualVisW);
               out.push(
                 truncateToWidth(
-                  theme.fg("borderMuted", "───") +
-                  theme.fg("accent", " " + title + " ") +
-                  theme.fg("borderMuted", "─".repeat(fillLen)),
+                  border("┌──") +
+                  border(" " + title + " ") +
+                  border("─".repeat(topFillLen) + "┐"),
                   width
                 )
               );
 
-              // Content rows
+              // Content rows with side borders: │ content │
               const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
               for (const line of visible) {
-                out.push(truncateToWidth(line, width));
+                const lineVisW = visibleWidth(line);
+                const padding = Math.max(0, innerWidth - lineVisW);
+                out.push(
+                  truncateToWidth(
+                    border("│") + " " + line + " ".repeat(padding) + " " + border("│"),
+                    width
+                  )
+                );
               }
-              // Fill remaining viewport
+              // Fill remaining viewport with empty bordered rows
               for (let i = visible.length; i < viewportRows; i++) {
-                out.push("");
+                out.push(
+                  truncateToWidth(
+                    border("│") + " ".repeat(width - 2) + border("│"),
+                    width
+                  )
+                );
               }
 
-              // Footer line
+              // Bottom border with help text: └─────── ↑↓/j/k scroll • esc close ──┘
               const scrollInfo = totalRows > viewportRows
                 ? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, totalRows)}/${totalRows}`
                 : "";
-              const helpText = ` ↑↓/j/k scroll • esc close${scrollInfo} `;
-              const footFill = Math.max(0, width - helpText.length);
+              const helpText = `↑↓/j/k scroll • esc close${scrollInfo}`;
+              const helpVisW = visibleWidth(helpText);
+              // Budget: └ (1) + fill + space (1) + help + space (1) + ──┘ (3) = width
+              const bottomFillLen = Math.max(0, width - 6 - helpVisW);
               out.push(
                 truncateToWidth(
-                  theme.fg("borderMuted", "─".repeat(footFill)) +
-                  theme.fg("dim", helpText),
+                  border("└" + "─".repeat(bottomFillLen)) +
+                  theme.fg("dim", " " + helpText + " ") +
+                  border("──┘"),
                   width
                 )
               );
@@ -2425,8 +2451,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             },
 
             handleInput(data: string): void {
-              const termH = process.stdout.rows || 40;
-              const viewportRows = Math.max(4, termH - 4);
+              const viewportRows = computeViewportRows();
               const actualContent = renderDashboardLines(state, process.stdout.columns || 120, theme, 0);
               const totalRows = actualContent.length + (runtime.runningExperiment ? 1 : 0);
               const maxScroll = Math.max(0, totalRows - viewportRows);
