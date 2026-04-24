@@ -79,11 +79,14 @@ pi install https://github.com/davebcn87/pi-autoresearch
 
 **`autoresearch-finalize`** turns a noisy autoresearch branch into clean, independent branches — one per logical change, each starting from the merge-base. Groups must not share files, so each branch can be reviewed and merged independently.
 
+**`autoresearch-hooks`** *(optional)* helps author `autoresearch.hooks/before.sh` and `autoresearch.hooks/after.sh` for a session. It ships with ten reference scripts in [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) (external search, learnings journal, native notifications, anti-thrash, idea rotation, and more) — the skill handles the contract, you pick the inspiration. The core autoresearch loop has no hook awareness.
+
 | File | Purpose |
 |------|---------|
 | `autoresearch.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
 | `autoresearch.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
 | `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
+| `autoresearch.hooks/` | *(optional)* Executable scripts (`before.sh`, `after.sh`) that fire around iterations. Stdout is delivered to the agent as a steer message. |
 
 ---
 
@@ -241,6 +244,62 @@ pnpm typecheck
 - If checks fail, the experiment is logged as `checks_failed` (same behavior as a crash — no commit, revert changes).
 - The `checks_failed` status is shown separately in the dashboard so you can distinguish correctness failures from benchmark crashes.
 - Checks have a separate timeout (default 300s, configurable via `checks_timeout_seconds` in `run_experiment`).
+
+---
+
+## Hooks (optional)
+
+Drop executable scripts in `autoresearch.hooks/` to run code at iteration boundaries. Hooks are **transparent to the agent** — the agent calls tools and sees results; hooks run alongside without any agent-facing surface.
+
+- `autoresearch.hooks/before.sh` — fires before every iteration (at `/autoresearch` activation and at the end of every `log_experiment`, after `after.sh`). Use for prospective work: fetch research, prime context for the next attempt.
+- `autoresearch.hooks/after.sh` — fires at the end of every `log_experiment`. Use for retrospective work: annotate learnings, send notifications.
+
+**Contract:**
+
+- Must be executable (`chmod +x`). Preserved on revert like all `autoresearch.*` artefacts.
+- **Stdin** — a JSON object on a single line. Shape depends on the stage (see below). Extract fields with `jq`.
+- **Stdout** is delivered to the agent as a steer message (capped at 8 KB). Empty stdout = silent.
+- Non-zero exit or >30s timeout surfaces an error steer to the agent.
+- Each fire appends a `{"type":"hook",…}` entry to `autoresearch.jsonl` for observability.
+
+**`before.sh` stdin** (on fresh activation `last_run` is `null`):
+
+```json
+{
+  "event": "before",
+  "cwd": "/path/to/workdir",
+  "next_run": 6,
+  "last_run": {
+    "run": 5, "status": "discard", "metric": 42.1,
+    "description": "…",
+    "asi": { "hypothesis": "…", "next_focus": "…" }
+  },
+  "session": {
+    "metric_name": "total_ms", "metric_unit": "ms", "direction": "lower",
+    "baseline_metric": 40.7, "best_metric": 33.5,
+    "run_count": 5, "goal": "optimize sort speed"
+  }
+}
+```
+
+**`after.sh` stdin:**
+
+```json
+{
+  "event": "after",
+  "cwd": "/path/to/workdir",
+  "run_entry": {
+    "run": 6, "status": "discard", "metric": 38.9,
+    "description": "…",
+    "asi": { "hypothesis": "…", "learned": "…" }
+  },
+  "session": { "metric_name": "total_ms", "direction": "lower", "baseline_metric": 40.7, "best_metric": 33.5, "run_count": 6, "goal": "…" }
+}
+```
+
+**Agent signal.** The agent writes `description` and `asi.*` fields in its `log_experiment` calls for its own future-self reasoning. The hook opportunistically mines whichever fields the agent naturally uses — `asi.hypothesis`, `asi.next_focus`, `description`, etc. There is no dedicated "hook input" field; the agent is unaware the hook exists.
+
+**Examples.** Reference scripts for both stages live at [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) — external search, qmd document search, persistent learnings, native notifications, git tagging, anti-thrash, idea rotator, hypothesis reflection, context rotation, token budget. Copy one to your session's `autoresearch.hooks/` directory, adapt, `chmod +x`.
 
 ---
 
