@@ -22,7 +22,7 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 ## Quick start
 
 ```bash
-pi install https://github.com/davebcn87/pi-autoresearch
+pi install npm:pi-autoresearch
 ```
 
 ## What's included
@@ -93,7 +93,7 @@ pi install https://github.com/davebcn87/pi-autoresearch
 ## Install
 
 ```bash
-pi install https://github.com/davebcn87/pi-autoresearch
+pi install npm:pi-autoresearch
 ```
 
 <details>
